@@ -1,0 +1,213 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Assam road risk: live routes</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  :root { --ink:#1d2a2e; --muted:#5b6b70; --line:#e3e8ea; --accent:#0f766e; --warn:#b42318; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, Segoe UI, sans-serif; color:var(--ink); background:#f6f8f9; }
+  header { background:var(--ink); color:#fff; padding:14px 20px; }
+  header h1 { margin:0; font-size:18px; }
+  header p { margin:4px 0 0; font-size:13px; opacity:.8; }
+  .wrap { display:grid; grid-template-columns: 340px 1fr; gap:16px; padding:16px; }
+  @media (max-width: 900px) { .wrap { grid-template-columns: 1fr; } }
+  .panel { background:#fff; border:1px solid var(--line); border-radius:10px; padding:14px; }
+  .panel h2 { font-size:14px; margin:0 0 10px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); }
+  label { display:block; font-size:12px; color:var(--muted); margin:8px 0 4px; }
+  select, input { width:100%; padding:8px; font-size:14px; border:1px solid #cdd6d9; border-radius:6px; background:#fff; }
+  button { width:100%; margin-top:12px; padding:10px; font-size:15px; border:0; border-radius:6px; background:var(--accent); color:#fff; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:wait; }
+  .msg { color:var(--warn); font-size:13px; min-height:1em; margin-top:8px; }
+  .status { font-size:12px; color:var(--muted); margin-top:10px; line-height:1.5; }
+  #map { height: 460px; border-radius:10px; border:1px solid var(--line); }
+  .route { border:2px solid var(--line); border-left-width:8px; border-radius:10px; padding:12px 14px; margin-bottom:12px; background:#fff; cursor:pointer; }
+  .route.active { box-shadow: 0 0 0 2px var(--accent); }
+  .route.rec { border-color:#bfe3dc; }
+  .route-head { display:flex; justify-content:space-between; align-items:center; gap:8px; }
+  .route-title { font-weight:700; font-size:16px; }
+  .badge { font-size:11px; padding:3px 8px; border-radius:999px; background:#e6f4f1; color:var(--accent); font-weight:600; }
+  .path { font-size:14px; margin:6px 0 10px; color:var(--ink); }
+  .grid { display:grid; grid-template-columns: repeat(3, 1fr); gap:8px; }
+  @media (max-width: 600px) { .grid { grid-template-columns: 1fr 1fr; } }
+  .stat { background:#f6f8f9; border-radius:8px; padding:8px; }
+  .stat small { display:block; font-size:11px; color:var(--muted); }
+  .stat b { font-size:16px; }
+  .sub { font-size:12px; font-weight:600; color:var(--muted); margin:12px 0 6px; text-transform:uppercase; letter-spacing:.03em; }
+  .gm { font-size:13px; color:var(--ink); margin-top:10px; }
+  .gm.bad { color:var(--warn); }
+  details { font-size:12px; color:var(--muted); margin-top:14px; }
+  details p { margin:6px 0; }
+  .empty { color:var(--muted); font-size:14px; padding:20px; text-align:center; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Assam road risk: live routes</h1>
+  <p>Roads and distance from OSRM (OpenStreetMap). Rain and flood from Open-Meteo, today.</p>
+</header>
+
+<div class="wrap">
+  <aside>
+    <div class="panel">
+      <h2>Trip</h2>
+      <label for="origin">From</label><select id="origin"></select>
+      <label for="dest">To</label><select id="dest"></select>
+      <button id="go">Find routes</button>
+      <div class="msg" id="msg"></div>
+      <div class="status" id="status"></div>
+    </div>
+
+    <div class="panel" style="margin-top:12px">
+      <h2>Assumptions (change if needed)</h2>
+      <label for="speed">Average speed (km/h)</label>
+      <input id="speed" type="number" min="5" step="1" value="40">
+      <label for="mileage">Truck mileage (km per litre)</label>
+      <input id="mileage" type="number" min="1" step="0.1" value="4">
+      <label for="price">Diesel price (₹ per litre)</label>
+      <input id="price" type="number" min="1" step="0.5" value="92">
+    </div>
+  </aside>
+
+  <main>
+    <div id="map"></div>
+    <div id="cards" style="margin-top:12px"></div>
+  </main>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+const COLORS = ["#1f5fbf", "#c2410c", "#7c3aed", "#0f766e", "#b45309"];
+const map = L.map("map").setView([26.0, 92.5], 7);
+L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+  { maxZoom: 18, attribution: "&copy; OpenStreetMap contributors" }).addTo(map);
+const lineLayer = L.layerGroup().addTo(map);
+const markerLayer = L.layerGroup().addTo(map);
+let current = null, lines = [];
+
+const fmt = (n, d = 1) => Number(n).toLocaleString("en-IN", { maximumFractionDigits: d, minimumFractionDigits: d });
+const hm = mins => `${Math.floor(mins / 60)} h ${String(Math.round(mins % 60)).padStart(2, "0")} min`;
+const money = n => "₹ " + Math.round(n).toLocaleString("en-IN");
+
+async function getJSON(url) {
+  const r = await fetch(url);
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(body.error || ("Request failed: " + url));
+  return body;
+}
+
+function setMsg(t) { $("msg").textContent = t || ""; }
+
+async function init() {
+  try {
+    const places = await getJSON("/api/osrm/places");
+    const names = Object.keys(places);
+    names.forEach(n => { $("origin").add(new Option(n, n)); $("dest").add(new Option(n, n)); });
+    $("origin").value = names[0];
+    $("dest").value = names[names.length - 1];
+    Object.entries(places).forEach(([n, p]) => {
+      L.circleMarker([p.lat, p.lon], { radius: 6, color: "#1d2a2e", fillColor: "#fff", fillOpacity: 1, weight: 2 })
+        .bindTooltip(n).addTo(markerLayer);
+    });
+  } catch (err) { setMsg(err.message); }
+}
+
+async function find() {
+  setMsg("");
+  const o = $("origin").value, d = $("dest").value;
+  if (o === d) { setMsg("Choose two different districts."); return; }
+  $("status").textContent = "Loading live weather and roads. The first search can take a minute or two.";
+  $("go").disabled = true;
+  try {
+    current = await getJSON(`/api/live/osrm/${encodeURIComponent(o)}/${encodeURIComponent(d)}`);
+    draw();
+    const w = current.weather || {};
+    $("status").innerHTML =
+      `Weather fetched: ${current.fetched_at || "-"}<br>` +
+      `Rain (4 days, average across grid): ${w.rain_mm_mean ?? "-"} mm` +
+      (w.flood_ok === false ? `<br><span style="color:#b42318">River flood data was unavailable this time; risk uses rain only.</span>` : "");
+  } catch (err) {
+    setMsg(err.message);
+    $("status").textContent = "";
+  } finally {
+    $("go").disabled = false;
+  }
+}
+
+function drawLines(activeIdx) {
+  lineLayer.clearLayers(); lines = [];
+  current.routes.forEach((r, i) => {
+    const active = i === activeIdx;
+    const line = L.polyline(r.geometry, {
+      color: COLORS[i % COLORS.length],
+      weight: active ? 8 : 4,
+      opacity: active ? 0.95 : 0.55,
+      dashArray: r.recommended ? null : "8 6"
+    }).bindTooltip(`${r.label}: ${r.km} km`).addTo(lineLayer);
+    line.on("click", () => selectRoute(i));
+    lines.push(line);
+  });
+}
+
+function selectRoute(i) {
+  drawLines(i);
+  document.querySelectorAll(".route").forEach((el, j) => el.classList.toggle("active", j === i));
+  document.querySelectorAll(".route")[i]?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+function card(r, i) {
+  const speed = Number($("speed").value) || 40;
+  const mileage = Number($("mileage").value) || 4;
+  const price = Number($("price").value) || 92;
+  const minsAssumed = r.km / speed * 60;
+  const litres = r.km / mileage;
+  const cost = litres * price;
+  return `
+  <div class="route ${r.recommended ? "rec" : ""}" data-i="${i}" style="border-left-color:${COLORS[i % COLORS.length]}">
+    <div class="route-head">
+      <span class="route-title">${r.label}</span>
+      ${r.recommended ? '<span class="badge">Recommended</span>' : ""}
+    </div>
+    <div class="path">${r.path}</div>
+
+    <div class="grid">
+      <div class="stat"><small>Distance (OSRM)</small><b>${fmt(r.km)} km</b></div>
+      <div class="stat"><small>Time at ${speed} km/h (assumed)</small><b>${hm(minsAssumed)}</b></div>
+      <div class="stat"><small>Diesel needed</small><b>${fmt(litres)} L</b></div>
+      <div class="stat"><small>Diesel cost (₹${price}/L)</small><b>${money(cost)}</b></div>
+      <div class="stat"><small>OSRM free-flow time</small><b>${hm(r.osrm_minutes)}</b></div>
+      <div class="stat"><small>Km high-risk road</small><b>${fmt(r.km_high_risk)} km</b></div>
+    </div>
+
+    <div class="sub">Weather on this road (today)</div>
+    <div class="grid">
+      <div class="stat"><small>Rain, last 4 days</small><b>${fmt(r.rain_mm)} mm</b></div>
+      <div class="stat"><small>Rain risk</small><b>${fmt(r.rain_risk, 2)}</b></div>
+      <div class="stat"><small>Flood risk</small><b>${fmt(r.flood_risk, 2)}</b></div>
+    </div>
+    <div class="gm">Combined risk: <b>${fmt(r.avg_risk, 3)}</b> (0 = none, 1 = maximum)</div>
+  </div>`;
+}
+
+function draw() {
+  markerLayer.eachLayer(l => l.bringToFront && l.bringToFront());
+  const box = $("cards");
+  if (!current.routes.length) { box.innerHTML = `<div class="panel empty">No road found.</div>`; return; }
+  box.innerHTML = current.routes.map(card).join("");
+  document.querySelectorAll(".route").forEach(el =>
+    el.addEventListener("click", () => selectRoute(Number(el.dataset.i))));
+  drawLines(0);
+  document.querySelectorAll(".route")[0].classList.add("active");
+  const bounds = current.routes.flatMap(r => r.geometry);
+  map.fitBounds(bounds, { padding: [30, 30] });
+}
+
+["speed", "mileage", "price"].forEach(id => $(id).addEventListener("input", () => { if (current) draw(); }));
+$("go").addEventListener("click", find);
+init();
+</script>
+</body>
+</html>
